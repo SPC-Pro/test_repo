@@ -1,0 +1,117 @@
+name: QA Auto Check (Testiny)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  checks: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  verify-testiny-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Buscar test run cerrado en Testiny
+        uses: actions/github-script@v7
+        env:
+          TESTINY_BASE_URL: ${{ secrets.TESTINY_BASE_URL }}
+          TESTINY_PROJECT_ID: ${{ secrets.TESTINY_PROJECT_ID }}
+          TESTINY_API_KEY: ${{ secrets.TESTINY_API_KEY }}
+        with:
+          script: |
+            const baseUrl = process.env.TESTINY_BASE_URL?.replace(/\/+$/, '');
+            const projectId = Number(process.env.TESTINY_PROJECT_ID);
+            const apiKey = process.env.TESTINY_API_KEY;
+            const prNumber = context.payload.pull_request.number;
+            const sha = context.payload.pull_request.head.sha;
+            const prUrl = context.payload.pull_request.html_url;
+
+            if (!baseUrl || !Number.isFinite(projectId) || !apiKey) {
+              await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'QA Manual Testiny',
+                head_sha: sha,
+                status: 'completed',
+                conclusion: 'failure',
+                output: {
+                  title: 'QA — Configuracion incompleta',
+                  summary: 'Faltan secretos requeridos: TESTINY_BASE_URL, TESTINY_PROJECT_ID o TESTINY_API_KEY.',
+                  text: `PR: ${prUrl}\nPR Number: #${prNumber}`,
+                },
+              });
+              return;
+            }
+
+            let foundRun = null;
+            let errorMessage = null;
+
+            try {
+              const response = await fetch(`${baseUrl}/api/v1/testrun/find`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Api-Key': apiKey,
+                },
+                body: JSON.stringify({
+                  filter: {
+                    and: [
+                      { project_id: projectId },
+                      { title: { op: 'like', value: `%#${prNumber}%` } },
+                      { is_closed: true },
+                    ],
+                  },
+                  order: [{ column: 'id', order: 'desc' }],
+                  pagination: { limit: 1 },
+                }),
+              });
+
+              if (!response.ok) {
+                errorMessage = `Error al consultar Testiny: HTTP ${response.status} ${response.statusText}`;
+              } else {
+                const body = await response.json();
+                if (body.data?.length) {
+                  foundRun = body.data[0];
+                }
+              }
+            } catch (error) {
+              errorMessage = `Error de red al consultar Testiny: ${error.message}`;
+            }
+
+            let conclusion = 'failure';
+            let title = 'QA — Sin test run cerrado';
+            let summary = [
+              `No se encontro ningun test run cerrado en Testiny cuyo titulo contenga #${prNumber}.`,
+              '',
+              'Para aprobar este check, crea un test run en Testiny que:',
+              `- Incluya #${prNumber} en el titulo`,
+              '- Este cerrado antes del merge.',
+            ].join('\n');
+            let detailsUrl = `${baseUrl}/p/${projectId}/testruns`;
+
+            if (errorMessage) {
+              title = 'QA — Error al consultar Testiny';
+              summary = errorMessage;
+            } else if (foundRun) {
+              conclusion = 'success';
+              title = 'QA — Test run cerrado encontrado';
+              summary = `Se encontro un test run cerrado para PR #${prNumber}: ${foundRun.title} (ID: ${foundRun.id}).`;
+              detailsUrl = `${baseUrl}/p/${projectId}/testruns/tr/${foundRun.id}`;
+            }
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'QA Manual Testiny',
+              head_sha: sha,
+              status: 'completed',
+              conclusion,
+              details_url: detailsUrl,
+              output: {
+                title,
+                summary,
+                text: `PR: ${prUrl}\nPR Number: #${prNumber}`,
+              },
+            });
